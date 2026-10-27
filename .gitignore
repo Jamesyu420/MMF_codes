@@ -1,0 +1,12 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Raw datasets too large for git history.
+# Force-add a single file later with: git add -f <path>
+data/mouse_brain/reference/sc_counts.csv
+data/mouse_brain/reference/all_cells_20200625.h5ad
+data/colorectal_cancer/scRNA.h5ad
+data/colorectal_cancer/Xenium_data.npz
+data/colorectal_cancer/Xenium_by_type/Epithelial/data.npz

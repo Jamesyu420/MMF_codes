@@ -1,0 +1,44 @@
+{
+  "count_policy": "Observed UMI on the shared panel. No molecule split and no train/test partition.",
+  "hvg": "Variance of log1p(CP10k) on HD and Xenium. Panel is the intersection of the two top-2000 lists.",
+  "hvg_per_assay": 2000,
+  "panel_genes": 1571,
+  "qc": {
+    "hd_min_counts": 50,
+    "hd_min_genes": 100,
+    "xenium_published_high_quality": true,
+    "xenium_min_counts": 20,
+    "xenium_min_genes": 20,
+    "min_cells_for_hvg": 20,
+    "scrna_source_already_filtered": true
+  },
+  "spots": {
+    "HD": 36503,
+    "Xenium": 365416,
+    "scRNA": 8288
+  },
+  "cell_types": [
+    "B",
+    "CD4T",
+    "CD8T",
+    "Endothelial",
+    "Epithelial",
+    "Fibroblast",
+    "Macrophage",
+    "Mast",
+    "Monocyte",
+    "Neutrophil",
+    "Other",
+    "Plasma",
+    "SMC",
+    "Tprolif"
+  ],
+  "rare_types_merged_to_Other": [
+    "mregDC",
+    "cDC2",
+    "pDC"
+  ],
+  "eta0": "Plug-in mean within broad type of per-cell fractions on the panel genes only.",
+  "scrna": "/home/byual/MMF_codes/data/colorectal_cancer/scRNA.h5ad",
+  "scrna_source": "/home/byual/Xenium_HD/data/SPATCH/COAD/scRNA/section_unresolved/original/adata.h5ad"
+}

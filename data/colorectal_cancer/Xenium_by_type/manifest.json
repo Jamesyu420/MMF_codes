@@ -1,0 +1,72 @@
+[
+  {
+    "cell_type": "B",
+    "N": 2365,
+    "G": 1410
+  },
+  {
+    "cell_type": "CD4T",
+    "N": 16786,
+    "G": 1568
+  },
+  {
+    "cell_type": "CD8T",
+    "N": 11673,
+    "G": 1565
+  },
+  {
+    "cell_type": "Endothelial",
+    "N": 13924,
+    "G": 1553
+  },
+  {
+    "cell_type": "Epithelial",
+    "N": 181052,
+    "G": 1571
+  },
+  {
+    "cell_type": "Fibroblast",
+    "N": 49497,
+    "G": 1568
+  },
+  {
+    "cell_type": "Macrophage",
+    "N": 21686,
+    "G": 1568
+  },
+  {
+    "cell_type": "Mast",
+    "N": 922,
+    "G": 1389
+  },
+  {
+    "cell_type": "Monocyte",
+    "N": 2047,
+    "G": 1488
+  },
+  {
+    "cell_type": "Neutrophil",
+    "N": 10784,
+    "G": 1568
+  },
+  {
+    "cell_type": "Other",
+    "N": 2525,
+    "G": 1491
+  },
+  {
+    "cell_type": "Plasma",
+    "N": 35479,
+    "G": 1566
+  },
+  {
+    "cell_type": "SMC",
+    "N": 12688,
+    "G": 1551
+  },
+  {
+    "cell_type": "Tprolif",
+    "N": 3988,
+    "G": 1520
+  }
+]

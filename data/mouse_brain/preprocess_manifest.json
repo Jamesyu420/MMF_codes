@@ -1,0 +1,113 @@
+{
+  "count_policy": "Observed UMI on the shared panel. No molecule split and no train/test partition.",
+  "svg": "Moran I on log1p(CP10k), 6 nearest image-coordinate neighbors, row-standardized weights.",
+  "svg_per_section": 1000,
+  "qc": {
+    "min_counts": 1000,
+    "min_genes": 500,
+    "max_mitochondrial_fraction": 0.4,
+    "min_spots_per_gene": 10,
+    "mitochondrial_genes_excluded_from_svg": true
+  },
+  "sections": {
+    "Visium_1": {
+      "spots_before": 4168,
+      "spots_after": 4097,
+      "removed_low_count": 3,
+      "removed_few_genes": 2,
+      "removed_high_mt": 68,
+      "total_counts_median": 19045.0,
+      "genes_detected_median": 5084.5,
+      "mitochondrial_fraction_median": 0.20504876975568964,
+      "mitochondrial_genes": 13,
+      "genes_candidate": 17359
+    },
+    "Visium_2": {
+      "spots_before": 3925,
+      "spots_after": 3892,
+      "removed_low_count": 5,
+      "removed_few_genes": 3,
+      "removed_high_mt": 28,
+      "total_counts_median": 17941.0,
+      "genes_detected_median": 4898.0,
+      "mitochondrial_fraction_median": 0.20133772451023665,
+      "mitochondrial_genes": 13,
+      "genes_candidate": 17179
+    }
+  },
+  "union_genes": 1089,
+  "panel_genes": 1067,
+  "absent_from_reference": [
+    "1700094D03Rik",
+    "2010204K13Rik",
+    "2810468N07Rik",
+    "9130024F11Rik",
+    "Atp5md",
+    "Ccn2",
+    "Ccn3",
+    "Ecrg4",
+    "Gas5",
+    "Inka2",
+    "Minar2",
+    "Mrtfb",
+    "Oip5os1",
+    "Pakap.1",
+    "Plaat3",
+    "Rnf227",
+    "Shisal1",
+    "Sox2ot",
+    "Tafa1",
+    "Tafa2",
+    "Tafa4",
+    "Vxn"
+  ],
+  "reference": "/home/byual/MMF_codes/data/mouse_brain/reference/all_cells_20200625.h5ad",
+  "reference_cells": 40532,
+  "reference_universe_genes": 29814,
+  "cell_types": [
+    "AmygdalarExc",
+    "Astrocyte",
+    "CorticalExc",
+    "Endothelial",
+    "HippocampalExc",
+    "Inhibitory",
+    "Microglia",
+    "Neuroblast",
+    "OPC",
+    "Oligodendrocyte",
+    "OtherExc",
+    "ThalamicExc",
+    "UnknownLowQ"
+  ],
+  "eta0": "Mean within broad type of panel UMI divided by the common-universe UMI. Panel is not renormalized.",
+  "outputs": [
+    {
+      "section": "Visium_1",
+      "spots": 4097,
+      "genes": 1067,
+      "removed_spots": 71,
+      "dropped_zero_panel": 0,
+      "coordinate_origin": [
+        0.0,
+        0.0
+      ],
+      "coordinate_scale": 6450.234,
+      "total_umi": 27049030,
+      "file": "/home/byual/MMF_codes/data/mouse_brain/Visium_1.npz"
+    },
+    {
+      "section": "Visium_2",
+      "spots": 3892,
+      "genes": 1067,
+      "removed_spots": 33,
+      "dropped_zero_panel": 0,
+      "coordinate_origin": [
+        0.0,
+        0.0
+      ],
+      "coordinate_scale": 6626.142,
+      "total_umi": 23589255,
+      "file": "/home/byual/MMF_codes/data/mouse_brain/Visium_2.npz"
+    }
+  ]
+}
