@@ -1,17 +1,18 @@
-"""Score finished simulation fits against held-out truth. Fitting never imports this module."""
+"""Score completed fits against simulation truth; retain every requested status."""
+import argparse
 import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from utils.io import load_npz, repo_root
-from utils.metrics import RNA_share, SIM_METHODS, TRUE_K, corr, one_case
+from MMF._utils.io import load_npz, repo_root
+from MMF._utils.metrics import RNA_share, SIM_METHODS, TRUE_K, corr, one_case
 
 ROOT = repo_root()
-DATA = ROOT / "data/simu_data/simulation"
-RESULTS = ROOT / "Simulation/results"
-OUT = ROOT / "Simulation/analysis"
+DATA = ROOT / "results/20261028/primary50/inputs"
+RESULTS = ROOT / "results/20261028/primary50"
+OUT = ROOT / "results/20261028/analysis"
 
 
 def sha(path):
@@ -27,11 +28,8 @@ def validate_simulation_selection(directory, status):
     selection = read_json(directory / "selection.json")
     assert selection["phase"] == "finished" and selection["selection_complete"] and not selection["heldout_or_truth_read"]
     assert selection["final_ranks"] == status["selected_ranks"]
-    terminal = [i for i, entry in enumerate(selection["rounds"]) if "terminal_fit" in entry]
-    assert terminal
-    last = terminal[-1]
-    phase = selection["rounds"][last]["terminal_fit"]
-    assert all(not entry["accepted"] for entry in selection["rounds"][last:])
+    phase = read_json(directory / "polish" / "phase.json")
+    assert phase["ranks"] == status["selected_ranks"] and status["continuous_fit_stable"]
     assert phase["status"] == "training_probe_stable" and phase["steps"] >= 500 and phase["strict_exit_validation"]["passed"]
     history = phase["history"][-10:]
     assert len(history) == 10
@@ -56,32 +54,48 @@ def finished_fit(directory, method):
 
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--seeds", default=",".join(map(str, range(2026102901, 2026102951))))
+    parser.add_argument("--methods", nargs="+", choices=SIM_METHODS, default=SIM_METHODS)
+    args = parser.parse_args()
+    seeds = list(map(int, args.seeds.split(",")))
+    args.output.mkdir(parents=True, exist_ok=True)
     rows, pirows, programs, ranks, availability, rna = [], [], [], [], [], []
-    for seed in range(202610201, 202610251):
-        case = DATA / f"gradient_{seed}_depth4x"
+    for seed in seeds:
+        case = args.data / f"input_{seed}"
         truth = load_npz(case / "evaluation_only.npz")
         training = load_npz(case / "fit_input.npz")
         assert np.array_equal(np.bincount(truth["program_cell_type"], minlength=5), TRUE_K)
         target = RNA_share(truth["pi_true"], training["eta0"], truth["h_true"], truth["loadings_true"],
                            truth["program_cell_type"], truth["gamma_true"])
-        for method in SIM_METHODS:
-            directory = RESULTS / f"sim_{seed}_{method}"
+        for method in args.methods:
+            directory = args.results / f"sim_{seed}_{method}"
             status = finished_fit(directory, method)
-            availability.append(dict(seed=seed, method=method, status="completed" if status else "pending"))
+            receipt = directory / ("experiment_status.json" if method == "MMF" else "execution_receipt.json")
+            observed = read_json(receipt).get("phase", "pending") if receipt.exists() else "pending"
+            availability.append(dict(seed=seed, method=method, status="completed" if status else observed))
             if status is None:
                 continue
             assert status["input_sha256"] == sha(case / "fit_input.npz")
+            assert status["source_unchanged"]
             if method == "RCTD":
                 table = pd.read_csv(directory / "proportions.csv", index_col=0)
                 fit = {"pi": table[[f"T{c + 1}" for c in range(5)]].to_numpy()}
             elif method == "MMF":
                 validate_simulation_selection(directory, status)
                 fit = load_npz(directory / "final.npz")
+                assert all(np.isfinite(v).all() for v in fit.values() if v.dtype.kind in "biufc")
+                assert (fit["pi"] >= 0).all() and (fit["loadings"] >= 0).all() and (fit["h_sd"] >= 0).all()
+                np.testing.assert_allclose(fit["pi"].sum(1), 1, atol=1e-5)
+                np.testing.assert_allclose(fit["loadings"].sum(1), 1, atol=1e-5)
                 selected = np.bincount(fit["program_cell_type"], minlength=5)
                 assert selected.tolist() == status["selected_ranks"]
                 ranks.append(dict(
                     seed=seed, exact_vector=bool(np.array_equal(selected, TRUE_K)),
+                    rank_search_stationary_verified=status["rank_search_stationary_verified"],
                     total_rank=int(selected.sum()), null_type_false_positive=bool(selected[2] > 0),
                     **{f"K{c + 1}": int(selected[c]) for c in range(5)}))
             else:
@@ -102,20 +116,14 @@ def main():
         "rank_selection": ranks, "availability": availability, "RNA_share_metrics": rna,
     }
     for name, values in tables.items():
-        pd.DataFrame(values).to_csv(OUT / f"{name}.csv", index=False)
-    summary = dict(all250_complete=len(rows) == 250, n_MMF=len(ranks),
+        pd.DataFrame(values).to_csv(args.output / f"{name}.csv", index=False)
+    summary = dict(all_requested_complete=len(rows) == len(args.methods) * len(seeds),
+                   methods=args.methods, requested_fits=len(args.methods) * len(seeds), completed_fits=len(rows), n_MMF=len(ranks),
                    exact_rank_successes=sum(x["exact_vector"] for x in ranks),
-                   rank_denominator_requested=50)
-    if summary["all250_complete"]:
-        frame = pd.DataFrame(rows)
-        mmf = frame[frame.method == "MMF"].copy()
-        mmf["score"] = mmf[["composition_correlation", "loading_cosine", "activity_correlation"]].rank(pct=True).mean(axis=1)
-        target = float(mmf.score.quantile(.75))
-        exact = {x["seed"] for x in ranks if x["exact_vector"]}
-        pool = mmf[mmf.seed.isin(exact)] if exact else mmf
-        choice = pool.assign(distance=(pool.score - target).abs()).sort_values(["distance", "seed"]).iloc[0]
-        summary["representative"] = dict(seed=int(choice.seed), score=float(choice.score), target_75th_percentile=target)
-    (OUT / "summary.json").write_text(json.dumps(summary, indent=2))
+                   rank_denominator_requested=len(seeds),
+                   rank_search_stationary_verified=all(x["rank_search_stationary_verified"] for x in ranks) if ranks else False)
+    summary["representative"] = dict(seed=seeds[0], rule="First prespecified seed, independent of outcomes")
+    (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 
 

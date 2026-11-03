@@ -1,14 +1,13 @@
-"""Pyro backfitting, shared observation noise, and program selection.
+"""Pyro backfitting and shared observation noise.
 
 log(lambda_ig) = log(lambda_structural_ig) + epsilon_ig with one shared
-variance and no -v/2 term. q(z) is diagonal. Rank search adds and deletes
-programs on private copies of this same model.
+variance and no -v/2 term. q(z) is diagonal. Rank search is
+``select_programs_ct``.
 """
 from __future__ import annotations
 
 import copy
 from dataclasses import replace
-from pathlib import Path
 
 import numpy as np
 import pyro
@@ -286,21 +285,6 @@ class UncenteredEpsilonMMF(MMF):
             adjusted_log_rate.exp()-yy*(b+m)+torch.lgamma(yy+1)+kl)
         return kl_global + self.N/len(idx)*negative_likelihood_and_local_KL.sum()
 
-    def _evaluate_elbo(self):
-        # Marginal Monte Carlo for E[log mixture]; the rate and local residual stay analytic.
-        value = 0.
-        with torch.no_grad(), torch.random.fork_rng(devices=self._cuda_devices):
-            for idx in self._chunks():
-                self._seed_rng(self.config.seed+100003)
-                value -= len(idx)/self.N*float(self.direct_loss(
-                    idx, particles=self.config.evaluation_particles))
-        return value
-
-    def _diagnostic_state(self):
-        state = super()._diagnostic_state()
-        state['epsilon_variance_change'] = self.v_eps.clone()
-        return state
-
     def update_epsilon_variance(self, *, record=True):
         """One exact full-data EB step, holding current Gaussian q_eps fixed.
 
@@ -330,36 +314,6 @@ class UncenteredEpsilonMMF(MMF):
                 self.epsilon_updates.append(row)
             return row
 
-    def fit(self):
-        """Native full-cycle entry point; external runners may own this schedule."""
-        with self._scope(), self._rng_scope():
-            self.set_optimization(lr=self.config.lr, num_particles=self.config.num_particles)
-            if not self._warm_started:
-                self._update_nuisance(self.config.nuisance_steps, reference_only=True)
-                self._update_shared_variances()
-                self._cycle(self.config.warm_start_sweeps)
-                self.update_epsilon_variance()
-                self._warm_started = True
-            previous_elbo, previous = self._evaluate_elbo(), self._diagnostic_state()
-            stable = 0
-            for _ in range(self.config.max_sweeps):
-                self._cycle(self.config.within_type_sweeps)
-                self._update_nuisance(self.config.nuisance_steps)
-                self._update_shared_variances()
-                if self.config.fit_pi:
-                    for _ in range(self.config.pi_steps):
-                        self._step_group('pi', self._batch())
-                self.update_epsilon_variance()
-                current_elbo, current = self._evaluate_elbo(), self._diagnostic_state()
-                changes = {name: self._relative_change(current[name], previous[name]) for name in current}
-                changes['elbo_change'] = abs(current_elbo-previous_elbo)/max(1, abs(previous_elbo))
-                self.history.append(dict(sweep=len(self.history)+1, elbo=current_elbo, **changes))
-                stable = stable+1 if max(changes.values()) < self.config.tolerance else 0
-                previous_elbo, previous = current_elbo, current
-                if stable >= self.config.patience:
-                    break
-        return self
-
     def posterior_summary(self, *, include_epsilon_arrays=False):
         result = super().posterior_summary()
         result.update(epsilon_prior_variance=self.v_eps.detach().cpu().numpy().copy(),
@@ -381,6 +335,26 @@ class UncenteredEpsilonMMF(MMF):
 class PyroBackfitMMF(UncenteredEpsilonMMF):
     """Coordinate SVI. Each step exposes one block to Pyro and holds the rest fixed."""
 
+    def backfit_cycle(self, batches, conditional_program=None):
+        """Visit each joint q(z)/W block, then shared effects and Pi.
+
+        Reuse the same batch sequence for each block. The caller updates the
+        shared epsilon variance after a whole-model cycle.
+        """
+        programs = self.programs if conditional_program is None else [conditional_program]
+        for p in programs:
+            for idx in batches:
+                self._step_group((*p, 'qw'), idx)
+            self._update_variance(*p)
+        if conditional_program is None:
+            for name in ('alpha', 'gamma'):
+                for idx in batches:
+                    self._step_group(name, idx)
+            self._update_shared_variances()
+            if self.config.fit_pi:
+                for idx in batches:
+                    self._step_group('pi', idx)
+
     def _step_group(self, block, idx, reference_only=False):
         if block == 'joint':
             raise ValueError('Use one coordinate block per SVI step')
@@ -393,27 +367,6 @@ class PyroBackfitMMF(UncenteredEpsilonMMF):
         self.optimizer_calls[str(block)] = self.optimizer_calls.get(str(block), 0) + 1
         return value
 
-    def generative_model(self, idx, reference_only=False):
-        a = pyro.sample('alpha', dist.Normal(torch.zeros(self.N, device=self.device,
-            dtype=self.dtype), self.v_alpha.sqrt()).to_event(1))
-        b = pyro.sample('gamma', dist.Normal(torch.zeros(self.G, device=self.device,
-            dtype=self.dtype), self.v_gamma.sqrt()).to_event(1))
-        z = {} if reference_only else {p: pyro.sample(f'z_{p[0]}_{p[1]}',
-            self._program_prior(*p)) for p in self.programs}
-        mix = (self._log_expected_mixture(idx, True) if reference_only
-               else self._log_mixture(idx, z))
-        with pyro.poutine.scale(scale=self.N / len(idx)):
-            e = pyro.sample('epsilon', dist.Normal(torch.zeros_like(self.Y[idx]),
-                self.v_eps.sqrt()).to_event(2))
-            lograte = self.log_N[idx, None] + a[..., idx, None] + b[..., None, :] + mix + e
-            pyro.sample('Y', dist.Poisson(lograte.exp()).to_event(2), obs=self.Y[idx])
-
-    def full_guide(self, idx, reference_only=False):
-        self._guide(idx, reference_only)
-        m, s, _ = self.epsilon_posterior(idx, reference_only)
-        with pyro.poutine.scale(scale=self.N / len(idx)):
-            pyro.sample('epsilon', dist.Normal(m, s.sqrt()).to_event(2))
-
 
 def epsilon_checkpoint_fields(model):
     return dict(epsilon_state_version=model.epsilon_state_version,
@@ -425,80 +378,11 @@ def epsilon_checkpoint_fields(model):
                 epsilon_mean_correction=False)
 
 
-def restore_epsilon_checkpoint_fields(model, state):
-    if state.get('epsilon_mean_correction') is not False:
-        raise ValueError('checkpoint does not explicitly certify uncentered epsilon')
-    if state.get('epsilon_variance_mode') != model.epsilon_variance_mode:
-        raise ValueError('epsilon variance mode mismatch')
-    if state.get('epsilon_state_version') != model.epsilon_state_version:
-        raise ValueError('unsupported epsilon checkpoint version')
-    value = torch.as_tensor(state['epsilon_prior_variance'], device=model.device,
-                            dtype=model.dtype)
-    if value.shape != model.v_eps.shape:
-        raise ValueError('epsilon variance shape mismatch')
-    floor = float(state['epsilon_variance_floor'])
-    if not torch.isfinite(value).all() or torch.any(value < 0):
-        raise ValueError('checkpoint epsilon variance must be finite and nonnegative')
-    if not np.isfinite(floor) or floor < 0:
-        raise ValueError('checkpoint epsilon floor must be finite and nonnegative')
-    model.v_eps.copy_(value)
-    model.epsilon_variance_floor = floor
-    model.epsilon_updates = copy.deepcopy(state.get('epsilon_updates', []))
-
-
 def clone_epsilon_state(parent, child):
     """Required after legacy helpers' shallow __dict__ copy."""
     child.v_eps = parent.v_eps.detach().clone()
     child.epsilon_updates = copy.deepcopy(parent.epsilon_updates)
     return child
-
-
-def load_epsilon_real_state(path, device, *, immutable_input=None, basis_path=None):
-    """Restore the existing real-runner payload plus epsilon checkpoint fields.
-
-    Optional path overrides support a deliberately reorganized canonical tree.
-    This restores a phase boundary; the returned batch/monitor state must still
-    be used by a runner that promises exact in-phase continuation.
-    """
-    from MMF.mmf import fit_config_from_mapping
-    from MMF.fit_mmf import _restore_adam_step_device
-    state = torch.load(path, map_location='cpu', weights_only=False)
-    if state.get('epsilon_variance_mode', 'shared') != 'shared':
-        raise ValueError('Only a shared epsilon variance can be restored')
-    if any(str(name).startswith('F_') for name in state['parameters']):
-        raise ValueError('Checkpoint contains a low-rank coefficient factor')
-    source = state['immutable_input'] if immutable_input is None else immutable_input
-    with np.load(source, allow_pickle=False) as z:
-        data = {key: z[key] for key in ['Y', 'eta0', 'pi', 'coords', 'library_size']}
-    config = fit_config_from_mapping(state['config'], device=device)
-    model = PyroBackfitMMF(**data, programs_per_type=state['ranks'], config=config,
-        epsilon_variance_mode='shared',
-        epsilon_variance=state['epsilon_prior_variance'],
-        epsilon_variance_floor=state['epsilon_variance_floor'])
-    with model._scope(), torch.no_grad():
-        for name, value in state['parameters'].items():
-            model._param_state['params'][name].copy_(value.to(model.device))
-        basis_source = state.get('basis_path') if basis_path is None else basis_path
-        if model.basis is not None:
-            model.basis.copy_(model._tensor(np.load(basis_source, allow_pickle=False)))
-        model.basis_metadata = state['basis_metadata']
-        model._initial_pi.copy_(state['initial_pi'].to(model.device))
-        model.v_alpha.copy_(state['v_alpha'].to(model.device))
-        model.v_gamma.copy_(state['v_gamma'].to(model.device))
-        for program, value in state['program_variances'].items():
-            model.v[program].copy_(value.to(model.device))
-        restore_epsilon_checkpoint_fields(model, state)
-    model.program_uids = state['program_uids']
-    model._rng_state = state['cpu_rng']
-    model._cuda_rng_state = state['cuda_rng']
-    for key, value in state['block_optimizer_states'].items():
-        model.block_optimizers[key] = torch.optim.Adam(
-            [model._param_state['params'][name] for name in model.group_names[key]],
-            lr=model.config.lr)
-        model.block_optimizers[key].load_state_dict(value)
-        _restore_adam_step_device(model.block_optimizers[key])
-    model._warm_started = True
-    return model, state
 
 
 def paired_draw_count(requested):
@@ -526,7 +410,6 @@ def copy_subset(parent, retained=None, seed=None):
     model._rng_state = parent._rng_state.clone()
     model._cuda_rng_state = None if parent._cuda_rng_state is None else parent._cuda_rng_state.clone()
     model._training_elbo = copy.copy(parent._training_elbo)
-    model._evaluation_elbo = copy.copy(parent._evaluation_elbo)
     old_program_names = {f'{prefix}_{c}_{k}' for c, k in parent.programs for prefix in ['w', 'mu', 'dvar']}
     renamed = {f'{prefix}_{c}_{k}': f'{prefix}_{new[0]}_{new[1]}'
         for (c, k), new in mapping.items() for prefix in ['w', 'mu', 'dvar']}
@@ -544,11 +427,10 @@ def copy_subset(parent, retained=None, seed=None):
         if name in parent.group_names:
             model._add_optimizer(name, parent.group_names[name])
     for c, k in model.programs:
-        model._add_optimizer((c, k, 'q'), [f'mu_{c}_{k}', f'dvar_{c}_{k}'])
-        model._add_optimizer((c, k, 'w'), [f'w_{c}_{k}'])
-    model.history = []
-    model.frozen_programs = ()
-    model._warm_started = True
+        model._add_program_optimizer(c, k)
+    model.restore_optimizer_states({key: {renamed.get(name, name): value
+        for name, value in state.items() if name not in old_program_names or name in renamed}
+        for key, state in parent.optimizer_states().items()})
     if hasattr(parent, 'v_eps'):
         clone_epsilon_state(parent, model)
     return model, mapping
@@ -568,8 +450,7 @@ def add_program(parent, c, idx, seed):
         pyro.param(f'mu_{c}_{k}', torch.zeros(d, device=model.device, dtype=model.dtype))
         pyro.param(f'dvar_{c}_{k}', torch.ones(d, device=model.device, dtype=model.dtype), constraint=constraints.positive)
         model.v[c, k] = model._tensor(1.)
-        model._add_optimizer((c, k, 'q'), [f'mu_{c}_{k}', f'dvar_{c}_{k}'])
-        model._add_optimizer((c, k, 'w'), [f'w_{c}_{k}'])
+        model._add_program_optimizer(c, k)
     model.expansion = seed_program(model, parent, c, k, idx, seed)
     return model
 
@@ -679,150 +560,3 @@ def fixed_training_score(model, idx, seed=91025, particles=8, batches=4):
 
 def ranks(model):
     return list(map(int, model.Kc))
-
-
-def select_programs(parent, *, seed_idx, seed, output, fit, score, export, write,
-                    tau=.065, k_max=3, forward_cycles=150, backfit_cycles=1000,
-                    max_rounds=45, restore=None):
-    """Select beneficial factors and profile weak-factor deletions.
-
-    ``fit(model, phase, prefix, cycles, conditional_program=None)`` mutates only
-    that private state and returns a JSON-compatible phase receipt. ``score``
-    uses the same fixed Monte Carlo streams at every compared state. No truth,
-    held-out observations, desired count vector, or type-specific threshold is
-    an input to this function.
-    """
-    # Optional restore(path)->model keeps only one candidate on the GPU.
-    # In this mode export(model,prefix) must create prefix+'.state.pt'.
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    report = dict(phase='selecting', threshold=tau, K_max=k_max,
-        rank_selection='unknown per-type ranks', heldout_or_truth_read=False,
-        proposal_gate='positive fixed-MC training ELBO gain; raw mean-effect RMS is screened only after whole-model backfitting',
-        winner='highest training ELBO among eligible proposals; smaller type breaks ties',
-        deletion_gate='mean-effect RMS <= tau AND positive training ELBO gain after deletion/refit',
-        rounds=[], deletions=[], current_ranks=ranks(parent), selection_complete=False)
-
-    def save():
-        report['current_ranks'] = ranks(parent)
-        write(output/'selection.json', report)
-
-    def delete_weak(model, folder, final=False):
-        """A small mean hW is a screen, never itself a deletion certificate."""
-        checked = set()
-        while True:
-            weak = [r for r in raw_program_norms(model) if r['rms'] <= tau and
-                    (r['cell_type'], r['program']) not in checked]
-            if not weak:
-                return model
-            row = min(weak, key=lambda r: (r['rms'], r['cell_type'], r['program']))
-            p = (row['cell_type'], row['program'])
-            before = score(model)
-            reduced, mapping = copy_subset(model, [q for q in model.programs if q != p])
-            prefix = folder/f'delete_{len(report["deletions"]):02d}_T{p[0]}P{p[1]}'
-            phase = fit(reduced, 'terminal' if final else 'backfit', prefix,
-                        6000 if final else backfit_cycles)
-            after = score(reduced)
-            accepted = bool(after > before)
-            receipt = dict(program=list(p), rms=row['rms'], baseline_elbo=before,
-                deleted_refit_elbo=after, delta_elbo=after-before, accepted=accepted,
-                phase_fit=phase, before_ranks=ranks(model), after_ranks=ranks(reduced),
-                surviving_reindexing=[dict(old=list(a), new=list(b)) for a, b in mapping.items()])
-            report['deletions'].append(receipt)
-            if accepted:
-                model = reduced
-                checked = set()
-                export(model, prefix/'accepted')
-            else:
-                checked.add(p)
-            save()
-
-    save()
-    terminal_polished = False
-    for round_index in range(1, max_rounds+1):
-        baseline = score(parent)
-        eligible_types = [c for c in range(parent.C) if parent.Kc[c] < k_max]
-        round_path = output/f'round{round_index:02d}'
-        entry = dict(round=round_index, parent_ranks=ranks(parent),
-            parent_elbo=baseline, proposals=[], trials=[], accepted=False)
-        report['rounds'].append(entry)
-        candidates = []
-        for c in eligible_types:
-            trial_seed = int(seed+100003*round_index+1009*c)
-            candidate = add_program(parent, c, seed_idx, trial_seed)
-            p = (c, parent.Kc[c])
-            prefix = round_path/f'type{c}'/'forward'
-            phase = fit(candidate, 'forward', prefix, forward_cycles, conditional_program=p)
-            elbo = score(candidate)
-            norm = next(r['rms'] for r in raw_program_norms(candidate, programs=[p])
-                        if (r['cell_type'], r['program']) == p)
-            row = dict(cell_type=c, new_program=p[1], seed=trial_seed,
-                training_elbo=elbo, delta_elbo=elbo-baseline, score_rms=norm,
-                eligible=bool(elbo > baseline), fit=phase,
-                initialization=candidate.expansion)
-            entry['proposals'].append(row)
-            if row['eligible']:
-                if restore is not None:
-                    # Persist only mutable model state. The runner's export
-                    # must write this path without duplicating immutable Y.
-                    checkpoint_prefix = prefix/'forward_candidate'
-                    export(candidate, checkpoint_prefix)
-                    candidates.append((row, str(checkpoint_prefix)+'.state.pt'))
-                else:
-                    candidates.append((row, candidate))
-            # No GPU model reference survives to the next forward proposal
-            # when disk-backed restore is enabled.
-            if restore is not None:
-                del candidate
-            save()
-        candidates.sort(key=lambda pair: (-pair[0]['training_elbo'], pair[0]['cell_type']))
-        for row, candidate_state in candidates:
-            candidate = restore(candidate_state) if restore is not None else candidate_state
-            p = (row['cell_type'], row['new_program'])
-            prefix = round_path/f'type{p[0]}'/'backfit'
-            phase = fit(candidate, 'backfit', prefix, backfit_cycles)
-            elbo = score(candidate)
-            norm = next(r['rms'] for r in raw_program_norms(candidate, programs=[p])
-                        if (r['cell_type'], r['program']) == p)
-            accepted = bool(elbo > baseline and norm > tau)
-            entry['trials'].append(dict(cell_type=p[0], new_program=p[1],
-                training_elbo=elbo, delta_elbo=elbo-baseline, score_rms=norm,
-                accepted=accepted, fit=phase))
-            save()
-            if not accepted:
-                if restore is not None:
-                    del candidate
-                continue
-            parent = delete_weak(candidate, round_path/'cleanup')
-            entry['accepted'] = True
-            entry['retained_ranks'] = ranks(parent)
-            export(parent, round_path/'accepted')
-            terminal_polished = False
-            break
-        if entry['accepted']:
-            save()
-            continue
-        if not terminal_polished:
-            report['phase'] = 'strict_terminal_polish'
-            phase = fit(parent, 'terminal', round_path/'terminal', 6000)
-            entry['terminal_fit'] = phase
-            parent = delete_weak(parent, round_path/'terminal_cleanup', final=True)
-            export(parent, round_path/'terminal'/'retained')
-            terminal_polished = True
-            save()
-            # Re-test births at the actual strictly polished incumbent. An old
-            # finite-search proposal cannot certify the final state's stop.
-            continue
-        report.update(phase='finished', selection_complete=True,
-            stop_reason='no eligible beneficial admissible birth at the strictly polished incumbent under K_max',
-            final_ranks=ranks(parent), final_training_elbo=score(parent),
-            final_program_norms=raw_program_norms(parent),
-            final_types_at_cap=[c for c in range(parent.C) if parent.Kc[c] >= k_max],
-            final_admissible_types=eligible_types)
-        export(parent, output/'final')
-        save()
-        return parent, report
-    report.update(phase='incomplete', stop_reason='round guard', final_ranks=ranks(parent))
-    export(parent, output/'incomplete_final')
-    save()
-    return parent, report

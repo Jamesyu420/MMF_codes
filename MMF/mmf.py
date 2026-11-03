@@ -1,10 +1,11 @@
 """MMF: Pyro SVI with empirical Bayes and nested program backfitting.
 
 Model: Poisson counts, Gaussian spatial activities, nonnegative gene loadings.
-Training: program guide -> loading -> EB variance, then shared effects and pi.
+Training: joint program guide/loading -> EB variance, then shared effects and pi.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+import copy
+from dataclasses import dataclass
 from functools import partial
 from typing import Optional
 
@@ -21,39 +22,20 @@ class FitConfig:
     kernel: str = "nystrom"
     lengthscale: float = 1.0
     n_landmarks: int = 128
-    max_sweeps: int = 20
-    within_type_sweeps: int = 1
-    q_steps: int = 5
-    w_steps: int = 5
+    program_steps: int = 10
     lr: float = 0.01
     batch_size: Optional[int] = None
     num_particles: int = 2
-    nuisance_steps: int = 5
     fit_pi: bool = True
-    pi_steps: int = 5
     pi_floor: float = 1e-6
-    root_steps: int = 80  # Legacy input compatibility; unused by the SVI backend.
     variance_floor: float = 1e-6
     seed: int = 0
     dtype: str = "float64"
     device: str = "cuda"
     evaluation_particles: int = 8
-    tolerance: float = 1e-4
-    patience: int = 3
     warm_start_sweeps: int = 1
     jitter: float = 1e-6
     chunk_size: int = 256
-
-
-def fit_config_from_mapping(mapping, **overrides):
-    """Build a FitConfig and reject a low-rank coefficient guide."""
-    allowed = {item.name for item in fields(FitConfig)}
-    guide_rank = mapping.get("guide_rank", 0)
-    if guide_rank not in (0, None) and int(guide_rank) != 0:
-        raise ValueError("Low-rank coefficient guides are not part of this model")
-    data = {key: value for key, value in mapping.items() if key in allowed}
-    data.update(overrides)
-    return FitConfig(**data)
 
 
 def _array(x):
@@ -83,7 +65,6 @@ def compute_reference_mean(X, labels, cell_types=None, library_size=None):
 class MMF:
     """Cell-type-specific programs with a fixed reference and Gaussian guide."""
     inference_backend = "pyro_svi_trace_mean_field_elbo"
-    frozen_programs = ()
     compute_reference_mean = staticmethod(compute_reference_mean)
 
     def __init__(self, Y, eta0, pi, coords=None, library_size=None,
@@ -113,11 +94,8 @@ class MMF:
         self._param_state = {"params": {}, "constraints": {}}
         self.group_names, self.optimizers, self.svis, self.v = {}, {}, {}, {}
         self._training_elbo = TraceMeanField_ELBO(num_particles=self.config.num_particles)
-        self._evaluation_elbo = TraceMeanField_ELBO(num_particles=self.config.evaluation_particles)
-        for elbo in (self._training_elbo, self._evaluation_elbo):
-            elbo.vectorize_particles = True
-            elbo.max_plate_nesting = 1
-        self.history, self._warm_started = [], False
+        self._training_elbo.vectorize_particles = True
+        self._training_elbo.max_plate_nesting = 1
         self._cuda_devices = [self.device.index or 0] if self.device.type == "cuda" else []
         with torch.random.fork_rng(devices=self._cuda_devices):
             self._seed_rng(self.config.seed)
@@ -221,8 +199,11 @@ class MMF:
             pyro.param(f"mu_{b}", 0.01 * torch.randn(d, device=self.device, dtype=self.dtype))
             pyro.param(f"dvar_{b}", self._tensor(np.ones(d)), constraint=constraints.positive)
             self.v[c, k] = self._tensor(1.0)
-            self._add_optimizer((c, k, "q"), [f"mu_{b}", f"dvar_{b}"])
-            self._add_optimizer((c, k, "w"), [f"w_{b}"])
+            self._add_program_optimizer(c, k)
+
+    def _add_program_optimizer(self, c, k):
+        self._add_optimizer((c, k, "qw"),
+                            [f"mu_{c}_{k}", f"dvar_{c}_{k}", f"w_{c}_{k}"])
 
     def _add_optimizer(self, key, names):
         """Expose only this block's parameters to SVI, never hide sample sites."""
@@ -236,6 +217,20 @@ class MMF:
             optimizer,
             loss=self._training_elbo,
         )
+
+    def optimizer_states(self):
+        """Include states awaiting their first update after a clone or restore."""
+        with self._scope():
+            return {key: copy.deepcopy({**opt._state_waiting_to_be_consumed,
+                                        **opt.get_state()})
+                    for key, opt in self.optimizers.items()}
+
+    def restore_optimizer_states(self, states):
+        """Restore Adam by parameter name, also accepting separate q/W blocks."""
+        by_name = {name: value for state in states.values() for name, value in state.items()}
+        for key, names in self.group_names.items():
+            self.optimizers[key].set_state({name: copy.deepcopy(by_name[name])
+                                           for name in names if name in by_name})
 
     @staticmethod
     def _hide_parameter(active_names, site):
@@ -359,32 +354,6 @@ class MMF:
             for c, k in self.programs:
                 pyro.sample(f"z_{c}_{k}", self._q_distribution(c, k))
 
-    def _cycle(self, within_sweeps):
-        """Visit each type and program: guide SVI, loading SVI, then EB variance."""
-        for c in range(self.C):
-            for _ in range(within_sweeps):
-                for k in range(self.Kc[c]):
-                    if (c, k) in self.frozen_programs:
-                        continue
-                    for kind, steps in (("q", self.config.q_steps), ("w", self.config.w_steps)):
-                        for _ in range(steps):
-                            self._step_group((c, k, kind), self._batch())
-                    self._update_variance(c, k)
-
-    def _diagnostic_state(self):
-        with torch.no_grad():
-            variances = torch.stack([self.v_alpha, self.v_gamma] + [self.v[p] for p in self.programs])
-            return {"rate_change": self._expected_counts(),
-                    "pi_change": self._pi().clone(), "variance_change": variances}
-
-    @staticmethod
-    def _relative_change(new, old):
-        return float(torch.linalg.vector_norm(new - old) / torch.linalg.vector_norm(old).clamp_min(1))
-
-    def fit(self):
-        """Observation noise is part of the fitted model; use PyroBackfitMMF."""
-        raise RuntimeError("Use MMF.fit on a prepared npz. The base class has no observation noise.")
-
     def _moments(self, c, k, idx):
         mu, dvar = self._q(c, k)
         if self.basis is None:
@@ -409,11 +378,6 @@ class MMF:
         b, t = self._shared("gamma")
         return (self.log_N[idx, None] + a[idx, None] + s[idx, None] / 2 + b + t / 2
                 + self._log_expected_mixture(idx, reference_only))
-
-    def _batch(self):
-        size = min(self.config.batch_size or self.N, self.N)
-        return (torch.arange(self.N, device=self.device) if size == self.N
-                else torch.randperm(self.N, device=self.device)[:size])
 
     def _chunks(self):
         for start in range(0, self.N, self.config.chunk_size):
@@ -446,33 +410,11 @@ class MMF:
                 mean, variance = self._shared(name)
                 v.copy_((mean.square() + variance).mean().clamp_min(self.config.variance_floor))
 
-    def _set_shared(self, name, mean, variance):
-        """Copy externally supplied Gaussian initial values; never an inference step."""
-        with torch.no_grad():
-            pyro.param(f"{name}_mean").unconstrained().copy_(mean)
-            pyro.param(f"{name}_var").unconstrained().copy_(variance.log())
-
-    def _update_nuisance(self, steps, reference_only=False):
-        for _ in range(steps):
-            self._step_group("alpha", self._batch(), reference_only=reference_only)
-            self._step_group("gamma", self._batch(), reference_only=reference_only)
-
     def _expected_counts(self):
         result = torch.empty_like(self.Y)
         for idx in self._chunks():
             result[idx] = self._log_expected_counts(idx).exp()
         return result
-
-    def _evaluate_elbo(self):
-        # Same latent draws per chunk; B/N weights give the full KL weight one.
-        with torch.no_grad(), torch.random.fork_rng(devices=self._cuda_devices):
-            self._evaluation_elbo.num_particles = self.config.evaluation_particles
-            value = 0.0
-            for idx in self._chunks():
-                self._seed_rng(self.config.seed + 100003)
-                value -= len(idx) / self.N * float(
-                    self._evaluation_elbo.loss(self._model, self._guide, idx))
-        return value
 
     def posterior_summary(self):
         """Conditional Gaussian summaries and analytic expected counts (reporting only)."""

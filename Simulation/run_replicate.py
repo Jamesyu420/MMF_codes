@@ -21,7 +21,8 @@ import time
 import numpy as np
 import torch
 from MMF.backfit import (PyroBackfitMMF, add_program, fixed_training_score, raw_program_norms,
-    select_programs, epsilon_checkpoint_fields, gaussian_epsilon_diagnostics)
+    epsilon_checkpoint_fields, gaussian_epsilon_diagnostics)
+from MMF.MMF_ctback import select_programs_ct
 from MMF.mmf import FitConfig
 
 sys.dont_write_bytecode = True
@@ -32,6 +33,10 @@ def parser():
     p.add_argument('--backend', choices=['pyro'], default='pyro')
     p.add_argument('--guide-rank', type=int, default=0)
     p.add_argument('--particles', type=int, default=8)
+    p.add_argument('--threshold', type=float, default=.065)
+    p.add_argument('--k-max', type=int, default=3)
+    p.add_argument('--lengthscale', type=float, default=.2)
+    p.add_argument('--landmarks', type=int, default=48)
     p.add_argument('--input', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--seed', type=int, required=True)
@@ -58,7 +63,7 @@ def sha(path):
 
 
 def sources():
-    names = ['MMF.mmf', 'MMF.fit_mmf', 'MMF.backfit']
+    names = ['MMF.mmf', 'MMF.backfit', 'MMF.MMF_ctback', 'MMF.real']
     files = {Path(__file__).resolve()}
     for name in names:
         files.add(Path(importlib.import_module(name).__file__).resolve())
@@ -135,20 +140,13 @@ class SimulationCallbacks:
                      max(float(np.linalg.norm(previous['epsilon_variance'])),
                          getattr(model,'epsilon_variance_floor',1e-8),1e-300))
 
-    def cycle(self, model, conditional_program=None):
-        """One full-data cycle is exactly one simulation epoch."""
+    def cycle(self, model, conditional_program=None, steps=None):
+        """Visit each block for ten full-data updates, then update epsilon EB."""
         idx = torch.arange(model.N, device=model.device)
-        for p in model.programs if conditional_program is None else [conditional_program]:
-            model._step_group((*p, 'q'), idx)
-            model._step_group((*p, 'w'), idx)
-            model._update_variance(*p)
+        steps = model.config.program_steps if steps is None else steps
+        model.backfit_cycle([idx]*steps, conditional_program)
         if conditional_program is None:
-            for name in ['alpha', 'gamma']:
-                model._step_group(name, idx)
-            model._update_shared_variances()
-            model._step_group('pi', idx)
-            if hasattr(model, 'v_eps'):
-                self.update_epsilon(model)
+            self.update_epsilon(model)
 
     def fit(self, model, phase, prefix, cycles, conditional_program=None):
         prefix = Path(prefix); prefix.mkdir(parents=True, exist_ok=True)
@@ -159,17 +157,18 @@ class SimulationCallbacks:
         if strict:
             previous = self.probe(model)
         with model._scope(), model._rng_scope():
-            for step in range(1, cycles+1):
+            for first_step in range(1, cycles+1, model.config.program_steps):
+                step = min(first_step+model.config.program_steps-1, cycles)
                 if time.time() >= self.deadline:
                     model._rng_state = torch.get_rng_state()
                     if model._cuda_devices:
                         model._cuda_rng_state = torch.cuda.get_rng_state(model.device)
                     self.export(model, prefix/'deadline', summary=False)
                     raise TimeoutError('Simulation wall-clock budget; full state saved')
-                lr = .02 if step <= 150 else .005 if step <= 1000 else .001 if step <= 3000 else .0002
-                model.set_optimization(lr=lr, num_particles=8)
-                self.cycle(model, conditional_program)
-                if step % 50:
+                lr = .02 if first_step <= 150 else .005 if first_step <= 1000 else .001 if first_step <= 3000 else .0002
+                model.set_optimization(lr=lr, num_particles=self.args.particles)
+                self.cycle(model, conditional_program, steps=step-first_step+1)
+                if step//50 == (first_step-1)//50 and step != cycles:
                     continue
                 if strict:
                     current = self.probe(model)
@@ -183,11 +182,7 @@ class SimulationCallbacks:
                     previous = current
                     history.append(row)
                     if step >= 500 and stable(history):
-                        # Every cycle above is one complete-data epoch, so each
-                        # 50-step monitor gap includes 50 genuine epsilon EB
-                        # events, rather than repeated unchanged variance reads.
-                        # Re-profile one additional complete EB step and probe
-                        # the state that will actually be exported.
+                        # Verify the exported state with one further full-data EB update.
                         if hasattr(model, 'v_eps'):
                             self.update_epsilon(model)
                         verified = self.probe(model)
@@ -224,7 +219,8 @@ class SimulationCallbacks:
             strict_exit_validation=exit_validation,
             conditional_program=None if conditional_program is None else list(conditional_program),
             monitor='Minimum500; two5 fixed-training ELBO windows relative<.005; last3 rate/Pi/structural-EBvariance/rawtypeeffect changes<.01; independent epsilon true relative norm changes<.01 and last3 genuine full-data EB events<.01; final full EB and re-probe; normalized log-root stationarity<1e-6',
-            optimizer='q/W/EB in turn; shared and Pi only whole-model; epsilon full-data EB once per whole-model cycle; no mean correction')
+            optimizer='profile epsilon; joint q(z)/W per program; cyclic backfitting; epsilon full-data EB once per whole-model cycle',
+            visit_steps=model.config.program_steps,step_unit='updates per structural coordinate')
         write(prefix/'phase.json', record)
         self.export(model, prefix/'checkpoint', summary=False)
         if strict and status != 'training_probe_stable':
@@ -320,10 +316,10 @@ def main():
     if not np.array_equal(data['library_size'],data['Y'].sum(1)) or np.any(data['library_size']<=0):
         raise ValueError('library_size must equal the positive observed row sum of the fitted gene panel')
     n = data['Y'].shape[0]
-    cfg = FitConfig(kernel='nystrom', lengthscale=.2, n_landmarks=min(48,n),
+    cfg = FitConfig(kernel='nystrom', lengthscale=args.lengthscale, n_landmarks=min(args.landmarks,n),
         dtype='float32', device=args.device, batch_size=n, chunk_size=n,
-        num_particles=args.particles, evaluation_particles=64, q_steps=1, w_steps=1,
-        nuisance_steps=1, pi_steps=1, warm_start_sweeps=0, lr=.02, seed=args.seed)
+        num_particles=args.particles, evaluation_particles=64,
+        warm_start_sweeps=0, lr=.02, seed=args.seed)
     cb = SimulationCallbacks(args)
     if args.interface_check:
         if n > 32 or data['Y'].shape[1] > 40:
@@ -337,7 +333,7 @@ def main():
     status = dict(phase='running', backend=args.backend, guide_rank=args.guide_rank, started_unix=began, budget_seconds=args.budget,
         seed=args.seed, pid=os.getpid(), host=socket.gethostname(), device=args.device, input_sha256=sha(args.input),
         source_sha256=source_hashes, config=asdict(cfg), truth_or_heldout_read=False,
-        automatic_rank=fixed is None, fixed_ranks=fixed, K_max=3, threshold=.065,
+        automatic_rank=fixed is None, fixed_ranks=fixed, K_max=args.k_max, threshold=args.threshold,
         fresh_K0=True, variance_mode=args.variance_mode, epsilon_mean_correction=False,
         epsilon_initial_variance=args.epsilon_initial_variance,
         epsilon_EB_schedule='full-data at each whole-model cycle; held fixed in conditional program proposals',
@@ -352,9 +348,10 @@ def main():
                           stop_reason='explicit --stop-after-k0; full requested study fit is not complete')
             return
         if fixed is None:
-            model, selected = select_programs(model, seed_idx=torch.arange(model.N, device=model.device),
-                seed=args.seed, output=args.output, fit=cb.fit, score=cb.score,
-                export=cb.export, write=write, tau=.065, k_max=3, restore=cb.restore)
+            model, selected = select_programs_ct(
+                model, seed_idx=torch.arange(model.N, device=model.device), seed=args.seed,
+                output=args.output, fit=cb.fit, score=cb.score, export=cb.export, write=write,
+                restore=cb.restore, tau=args.threshold, k_max=args.k_max)
         else:
             for c, count in enumerate(fixed):
                 for k in range(count):
